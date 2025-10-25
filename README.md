@@ -96,5 +96,5 @@ g_b = Sigmoid(MLP_g(Y_local_context))
 最终输出 (Y_t)： Y_t = (g_f[t] * Y_f[t]) + (g_b[t] * Y_b[t]) (这里的 * 是逐元素乘法)
 
 拓展：
-动态自适应卷积核：先得到双向输出：Y_f, Y_b（两遍 Mamba）。用一个感受野控制器 RFC，根据xt, Y_f, Y_b进行预测卷积核的
+动态自适应卷积核：先得到双向输出：Y_f, Y_b（两遍 Mamba）。用一个感受野控制器 RFC，根据xt, Y_f, Y_b进行预测卷积核的尺寸和配置。
 
