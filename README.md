@@ -1,4 +1,4 @@
-# Flexible Blocks Mamba
+# Flexible Block Mamba
 
 
 **简介**
