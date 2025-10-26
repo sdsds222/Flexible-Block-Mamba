@@ -1,3 +1,92 @@
+
+---
+
+## Flexible Block Mamba
+
+**Introduction**
+
+Flexible Blocks Mamba achieves "initial division into minimum blocks $\rightarrow$ parallel convolution scoring $\rightarrow$ merging adjacent blocks with the same properties only within the same parent $\rightarrow$ generating a guidance map" without altering the highly parallel core of the Mamba architecture. This approach retains the single block-level scan and high $O(N)$ parallelism while directing computational power toward critical segments on an as-needed basis, and it allows for enhanced modeling capabilities by executing a reversal (REV) on local segments.
+
+**Core Idea:** Without changing the highly parallel core SSM structure of Mamba, a **fast, parallelizable** pre-processing pipeline is used to generate a "Guidance Map," achieving **on-demand allocation of computational resources** (dynamic blocking) and **enhancement of local modeling capability** (local reversal, REV).
+
+#### **Step 1: Divide into Minimum Blocks $L_0$**
+
+* **Operation:** The input sequence $X = [x_1, x_2, \dots, x_N]$ is divided into non-overlapping, equally sized minimum blocks $B_0[i]$ based on a predefined hyperparameter $L_0$ (e.g., $L_0=64$).
+    * $B_0[i] = [x_{i \cdot L_0 + 1}, \dots, x_{(i+1) \cdot L_0}]$
+* **Purpose/Significance:**
+    1. **Determine Minimum Granularity:** Establishes the smallest unit for all subsequent judgments and merging operations.
+    2. **Ensure Parallelism and Alignment:** The $L_0$ block size is typically designed to match the efficient processing size of the Mamba block kernel on the GPU, ensuring the parallelism and alignment of subsequent operations.
+
+#### **Step 2: Convolutional Parallel Scoring and Attribute Labeling**
+
+* **Operation:**
+    1. **Parallel Feature Extraction:** Use a small number of **Conv1D** modules (multi-scale or dilated) to process the entire sequence $X$ in a single, parallel pass. This leverages the high parallelism of convolution to quickly capture local and multi-scale context features.
+    2. **Block-Level Aggregation and Scoring:** Aggregate the convolutional output features for each $L_0$ block using pooling (e.g., $\text{mean}/\text{max}/\text{std}$), then pass the result through a lightweight $MLP$ to obtain the block's **summary** and **score result**.
+    3. **Attribute Labeling:** Based on the score, label each minimum block $B_0[i]$ with its attribute, such as:
+        * **Consistency/Similarity:** The homogeneity of information within the block.
+        * **Directionality:** Whether the key information depends on forward dependence (default) or requires retrospective modeling (REV).
+* **Purpose:** To quickly and parallelly provide each fundamental computational unit with an **"identity tag"** usable for subsequent merging and binning.
+
+#### **Step 3: Same-Parent Merging (Strict Binary Alignment)**
+
+* **Operation:** This is a **hierarchical, bottom-up** merging process that strictly follows a binary tree structure, checking for merging only between adjacent blocks **within the same parent node**.
+    1. **Level 1 Check ($2 \cdot L_0$):** Check if the attributes (from Step 2 scoring) of adjacent minimum block pairs $(B_0[2j], B_0[2j+1])$ are consistent or similar.
+        * **If Passed:** Merge them into $B_1[j]$ (a block of size $2 \cdot L_0$).
+        * **If Failed:** They remain as two independent $L_0$ blocks and do not participate in higher-level merging.
+    2. **Iterative Check:** Check if adjacent $B_{k-1}$ block pairs $(B_{k-1}[2k], B_{k-1}[2k+1])$ are consistent. If consistent, they are combined into $B_k$ (a block of size $2^k \cdot L_0$).
+    3. **Iteration:** Repeat this process until no further merging is possible (i.e., all adjacent same-parent block pairs are no longer similar).
+* **Purpose:**
+    1. **Achieve Dynamic Sparsification:** Merge homogeneous regions into larger blocks, reducing the total number of blocks the Mamba core operator must process, thereby saving computational resources.
+    2. **On-Demand Power Allocation:** Critical segments with high attribute differences are retained as smaller blocks, receiving higher computational resolution.
+
+#### **Step 4: Re-merging of Adjacent Homogeneous Regions (Optional Further Sparsification)**
+
+* **Operation:** After Step 3 is complete, if there are multiple **adjacent** blocks in the final output that are at the **same level** (e.g., both stopped at $2 \cdot L_0$ or $4 \cdot L_0$) and have the **same attributes**, further upward merging can be attempted.
+    * **Constraint:** Must adhere to the **binary constraint** and **cannot cross the original parent node boundaries**.
+* **Purpose:** To further reduce the total number of blocks and improve efficiency.
+
+#### **Step 5: Local Reversal (REV) for Enhanced Modeling**
+
+* **Operation (Pre-Reversal):**
+    1. Identify blocks in the final Guidance Map **labeled as REV** (e.g., based on Step 2 scoring, determining that the information flow within the block requires retrospection).
+    2. **Directly reverse the order of that subsequence in the input** before feeding the sequence into Mamba.
+        * Example: If $B_{rev} = [x_a, x_{a+1}, \dots, x_b]$ is marked as REV, the sequence actually fed into Mamba is $[x_b, x_{b-1}, \dots, x_a]$.
+* **Purpose:**
+    1. **Zero-Intrusion Bidirectional Modeling:** Mamba is fundamentally a unidirectional SSM. By pre-reversing, Mamba still performs a unidirectional scan, but for this local segment, it captures the backward/retrospective dependency, enhancing the modeling capability of that critical region while remaining compatible with the Mamba core.
+
+#### **Step 6: Generate Guidance Map**
+
+* **Operation:** Consolidate the results from Steps 3, 4, and 5 to generate the final Guidance Map.
+* **Guidance Map Content Example:** A set of tuples $(\text{start}_i, \text{length}_i, \text{type}_i, \text{flags}_i)$.
+    * $\text{start}_i, \text{length}_i$: Defines the subsequence range to be processed by the Mamba block kernel (from the merging results).
+    * $\text{type}_i$: Binning type, such as "High-Intensity SSM," "Low-Intensity SSM," "Identity," etc. (from attribute labeling or node gating).
+    * $\text{flags}_i$: Indicates additional information, such as whether "Local Reversal (REV)" was applied.
+* **Purpose:** Explicitly instructs the Mamba core operator **"what to do, where to do it, and what type of operation to use."**
+
+#### **Step 7: Execute Mamba according to Map (Core Computation)**
+
+* **Operation:**
+    1. **Binning and Block-Level Parallelism:** Bin the blocks according to $\text{type}_i$ in the map. Run the Mamba **Block Kernel** only on these binned blocks, achieving block-internal parallel computation.
+    2. **Block Summary Sequence Generation:** Calculate the output summary $H_i$ for each block.
+    3. **Block-Level Prefix Scan:** Perform a **Block-Level Prefix Scan** (Prefix Sum/Scan) on the block summary sequence $[H_1, H_2, \dots]$ to obtain the true starting states as required by Mamba's theory (i.e., the state transfer $\text{Mamba} \rightarrow \text{Mamba}$).
+        * This ensures Mamba's **global dependency** and **state association** are maintained while leveraging hardware acceleration.
+
+---
+
+### **Extension Concept (Node-Level Operator Gating) Explanation**
+
+* **Core Idea:** Not only control **which blocks merge**, but also control **the strength of the SSM operator used during merging**.
+* **Operation:** Before each upward merge (two child blocks $\rightarrow$ parent block), a **linear gate** ($G$) is applied to the child block summaries based on the attribute map from Step 2.
+    * **Gate Function Design:** $H_{\text{parent}} = \text{SSM}(\text{Gate}(H_{\text{child}_1}), \text{Gate}(H_{\text{child}_2}))$.
+    * **Form of the Gate:** $\text{Gate}(H) = \alpha \cdot H + (1-\alpha) \cdot \text{Identity}(H)$ (A linear mix of the summary $H$ and Identity $I$).
+        * **Gate Drive:** For instance, if labeled "Bidirectional," amplify the REV gate $\alpha$; if labeled "Unidirectional," attenuate the REV gate $\alpha$.
+* **Purpose:**
+    1. **Refined Control:** Allocate the reversal/bidirectional/computational intensity more precisely to critical **nodes/contexts**, rather than just the entire block.
+    2. **Maintain Parallelism:** Since the gate is designed as a **linear mix** of the child summary and identity, it is an **affine transformation** that does not change the interface dimensions and **preserves the Associativity** of the Mamba state transition. Therefore, it can still be implemented efficiently using **parallel prefix scan** or **tree-structured scan**.
+
+
+
+
 # Flexible Block Mamba
 
 
